@@ -24,14 +24,22 @@ import torchmetrics
 from torch.utils.tensorboard import SummaryWriter
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
+    # doesn't matter which source tokenizer we use here (target or source, both have it)
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
 
     # Precompute the encoder output and reuse it for every step
+    # we can name source, source_mask as encoder_input, encoder_mask, doesn't matter 
     encoder_output = model.encode(source, source_mask)
     # Initialize the decoder input with the sos token
+    # feed decoder with [SOS], and it will output the first token of the target sentence
+    # torch.empty(size) is a PyTorch function that creates a tensor with uninitialized values
+    # torch.empty(1, 1): creating a 2D tensor with 1 row and 1 column.
+    # Why two dimensions? one is for batch size, one is for the decoder  tokens
     decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
     while True:
+        # stop decoding (generating tokens) either when we reach the maximum length
+        # or when the model outputs the [EoS] token
         if decoder_input.size(1) == max_len:
             break
 
@@ -39,21 +47,26 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
         decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
 
         # calculate output
+        # decoder requires both the encoder output and decoder input
+        # encoder output is fixed, it was calculated once before the loop
+        # decoder input is growing at each step, it starts with [SoS] token
+        # and then it will be concatenated (torch.cat) with the "next_word" at each step
         out = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
 
-        # get next token
+        # get next token in a greedy manner: take the most probable token
         prob = model.project(out[:, -1])
         _, next_word = torch.max(prob, dim=1)
         decoder_input = torch.cat(
             [decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1
         )
 
+        # stop decoding when we reach the [EoS] token
         if next_word == eos_idx:
             break
-
+    # We remove the batch size, because, in the validation dataloader, the batch size is 1        
     return decoder_input.squeeze(0)
 
-
+# num_examples: number of sentences we want to inference
 def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2):
     model.eval()
     count = 0
@@ -71,9 +84,14 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
         # If we can't get the console width, use 80 as default
         console_width = 80
 
+    # we are disabling gradient calculation, 
+    # because we just want to inference the model not to train it
     with torch.no_grad():
         for batch in validation_ds:
+            # count the number of examples we have processed
+            # we just want to process num_examples examples
             count += 1
+            # in the validation dataloader, the batch size is 1
             encoder_input = batch["encoder_input"].to(device) # (b, seq_len)
             encoder_mask = batch["encoder_mask"].to(device) # (b, 1, 1, seq_len)
 
@@ -81,10 +99,16 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
             assert encoder_input.size(
                 0) == 1, "Batch size must be 1 for validation"
 
+            # When we do inference, we only need to calculate
+            # the encoder output once, and then reuse it for 
+            # every token that the model will output from the decoder
+            # the following function (greedy_decode) does that,
+            # only runs the encoder once
             model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
 
             source_text = batch["src_text"][0]
             target_text = batch["tgt_text"][0]
+            # We need to convert the output tokens to text by tokenizer
             model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
 
             source_texts.append(source_text)
@@ -92,15 +116,18 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
             predicted.append(model_out_text)
             
             # Print the source, target and model output
+            # it is recommended not to use "print" (directly print on console), while using tqdm
+            # instead use the "write" method of the tqdm object
             print_msg('-'*console_width)
             print_msg(f"{f'SOURCE: ':>12}{source_text}")
             print_msg(f"{f'TARGET: ':>12}{target_text}")
             print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
 
-            if count == num_examples:
+            if count == num_examples:# if we generated enough examples, stop
                 print_msg('-'*console_width)
                 break
-    
+    # why did we created these lists? source_texts, expected, predicted
+    # because, if the tensorboard writer is enabled, we want to compute some metrics
     if writer:
         # Evaluate the character error rate
         # Compute the char error rate 
@@ -315,6 +342,8 @@ def train_model(config):
             global_step += 1
 
         # Run validation at the end of every epoch
+        # we can also put validation in the batch loop, but
+        # in that case, we should put "model.train()" inside the batch loop
         run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)
 
         # Save the model at the end of every epoch
